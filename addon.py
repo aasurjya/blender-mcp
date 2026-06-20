@@ -15,10 +15,15 @@ import shutil
 import zipfile
 from bpy.props import IntProperty, BoolProperty
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib, hmac, base64
 import os.path as osp
 from contextlib import redirect_stdout, suppress
+from pathlib import Path
+import math
+import random
+import struct
+import bmesh
 
 bl_info = {
     "name": "Blender MCP",
@@ -283,6 +288,18 @@ class BlenderMCPServer:
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
+            # Scene operations (always on)
+            "create_primitive": self.create_primitive,
+            "delete_object": self.delete_object,
+            "set_material": self.set_material,
+            "export_scene": self.export_scene,
+            "render_scene": self.render_scene,
+            # Status handlers for optional integrations (always available)
+            "get_blenderkit_status": self.get_blenderkit_status,
+            "get_gaussian_splat_status": self.get_gaussian_splat_status,
+            # VR baking + export (always on)
+            "bake_lightmaps": self.bake_lightmaps,
+            "export_vr_fbx": self.export_vr_fbx,
         }
 
         # Add Polyhaven handlers only if enabled
@@ -322,6 +339,25 @@ class BlenderMCPServer:
             }
             handlers.update(hunyuan_handlers)
 
+        # Add BlenderKit handlers only if enabled
+        if bpy.context.scene.blendermcp_use_blenderkit:
+            blenderkit_handlers = {
+                "search_blenderkit_assets": self.search_blenderkit_assets,
+                "download_blenderkit_asset": self.download_blenderkit_asset,
+                "apply_blenderkit_material": self.apply_blenderkit_material,
+                "import_blenderkit_model": self.import_blenderkit_model,
+            }
+            handlers.update(blenderkit_handlers)
+
+        # Add Gaussian Splatting handlers only if enabled
+        if bpy.context.scene.blendermcp_use_gaussian_splat:
+            gaussian_splat_handlers = {
+                "export_gaussian_splat": self.export_gaussian_splat,
+                "export_splat_training_data": self.export_splat_training_data,
+                "convert_ply_to_splat": self.convert_ply_to_splat,
+            }
+            handlers.update(gaussian_splat_handlers)
+
         handler = handlers.get(cmd_type)
         if handler:
             try:
@@ -336,7 +372,165 @@ class BlenderMCPServer:
         else:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
 
+    # ------------------------------------------------------------------
+    # Scene operations (always-on) — ported from BlenderMCP scene_ops
+    # ------------------------------------------------------------------
 
+    def create_primitive(self, type="cube", name=None, size=1.0):
+        """Create a primitive mesh object in the scene."""
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+
+            if type == "cube":
+                bpy.ops.mesh.primitive_cube_add(size=size)
+            elif type == "sphere":
+                bpy.ops.mesh.primitive_uv_sphere_add(radius=size / 2)
+            elif type == "cylinder":
+                bpy.ops.mesh.primitive_cylinder_add(radius=size / 2, depth=size)
+            elif type == "cone":
+                bpy.ops.mesh.primitive_cone_add(radius1=size / 2, depth=size)
+            elif type == "torus":
+                bpy.ops.mesh.primitive_torus_add(major_radius=size / 2, minor_radius=size / 6)
+            elif type == "plane":
+                bpy.ops.mesh.primitive_plane_add(size=size)
+            elif type == "monkey":
+                bpy.ops.mesh.primitive_monkey_add(size=size)
+            else:
+                raise ValueError(f"Unknown primitive type: {type}")
+
+            obj = bpy.context.active_object
+            if name:
+                obj.name = name
+
+            return {
+                "success": True,
+                "name": obj.name,
+                "type": type,
+                "location": [obj.location.x, obj.location.y, obj.location.z],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def delete_object(self, name):
+        """Delete an object from the scene by name."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object not found: {name}"}
+
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.delete()
+
+            return {"success": True, "deleted": name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_material(self, object_name, material_name=None, color=None):
+        """Create/assign a Principled material on an object, optionally with a base color."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object not found: {object_name}"}
+
+            if material_name and material_name in bpy.data.materials:
+                mat = bpy.data.materials[material_name]
+            else:
+                mat_name = material_name or f"{object_name}_Material"
+                mat = bpy.data.materials.new(name=mat_name)
+
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            bsdf = nodes.get("Principled BSDF")
+
+            if bsdf and color:
+                r = color.get('r', color.get('R', 0.8))
+                g = color.get('g', color.get('G', 0.8))
+                b = color.get('b', color.get('B', 0.8))
+                bsdf.inputs['Base Color'].default_value = (r, g, b, 1.0)
+
+            if obj.data.materials:
+                obj.data.materials[0] = mat
+            else:
+                obj.data.materials.append(mat)
+
+            return {"success": True, "object": object_name, "material": mat.name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def export_scene(self, filepath, format="glb"):
+        """Export the scene to GLB, GLTF, FBX, OBJ, STL, or PLY.
+
+        Uses Blender 4.0+ operators (bpy.ops.wm.*_export) for OBJ/STL/PLY with a
+        fallback to the pre-4.0 operators for older Blender builds.
+        """
+        try:
+            ext = format.lower()
+            if ext in ("glb", "gltf"):
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    export_format='GLB' if ext == "glb" else 'GLTF_SEPARATE',
+                )
+            elif ext == "fbx":
+                bpy.ops.export_scene.fbx(filepath=filepath, path_mode="COPY", embed_textures=True)
+            elif ext == "obj":
+                if hasattr(bpy.ops.wm, "obj_export"):
+                    bpy.ops.wm.obj_export(filepath=filepath)
+                else:
+                    bpy.ops.export_scene.obj(filepath=filepath)
+            elif ext == "stl":
+                if hasattr(bpy.ops.wm, "stl_export"):
+                    bpy.ops.wm.stl_export(filepath=filepath)
+                else:
+                    bpy.ops.export_mesh.stl(filepath=filepath)
+            elif ext == "ply":
+                if hasattr(bpy.ops.wm, "ply_export"):
+                    bpy.ops.wm.ply_export(filepath=filepath)
+                else:
+                    bpy.ops.export_mesh.ply(filepath=filepath)
+            else:
+                return {"error": f"Unsupported export format: {format}"}
+
+            return {"success": True, "filepath": filepath, "format": format}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def render_scene(self, filepath, engine=None, resolution_x=None, resolution_y=None):
+        """Render the current scene to an image file."""
+        try:
+            scene = bpy.context.scene
+
+            if engine:
+                eng = engine.upper()
+                valid = ['CYCLES', 'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT', 'BLENDER_WORKBENCH']
+                if eng not in valid:
+                    return {"error": f"Unknown render engine: {engine}. Valid: {valid}"}
+                try:
+                    scene.render.engine = eng
+                except TypeError:
+                    # EEVEE was renamed to BLENDER_EEVEE_NEXT in Blender 4.2+
+                    if eng == 'BLENDER_EEVEE':
+                        scene.render.engine = 'BLENDER_EEVEE_NEXT'
+                    else:
+                        raise
+
+            if resolution_x:
+                scene.render.resolution_x = int(resolution_x)
+            if resolution_y:
+                scene.render.resolution_y = int(resolution_y)
+
+            scene.render.filepath = filepath
+            bpy.ops.render.render(write_still=True)
+
+            return {
+                "success": True,
+                "filepath": filepath,
+                "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+                "engine": scene.render.engine,
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     def get_scene_info(self):
         """Get information about the current Blender scene"""
@@ -2413,6 +2607,684 @@ class BlenderMCPServer:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
     #endregion
 
+    # ==================================================================
+    # BlenderKit integration — ported from BlenderMCP
+    # ==================================================================
+
+    def get_blenderkit_status(self):
+        api_key = self._bk_resolve_api_key()
+        addon_detected = self._bk_addon_installed()
+        cache_dir = self._bk_cache_dir()
+
+        mat_count = len(list(Path(cache_dir, "material").glob("*/asset.blend"))) if Path(cache_dir, "material").exists() else 0
+        model_count = len(list(Path(cache_dir, "model").glob("*/asset.blend"))) if Path(cache_dir, "model").exists() else 0
+
+        if not getattr(bpy.context.scene, "blendermcp_use_blenderkit", False):
+            return {
+                "enabled": False,
+                "message": (
+                    "BlenderKit integration is currently disabled. To enable it:\n"
+                    "1. In the 3D Viewport, find the BlenderMCP panel in the sidebar (press N if hidden)\n"
+                    "2. Check the 'Use BlenderKit' checkbox\n"
+                    "3. Paste your API key from blenderkit.com/profile (optional for free assets)\n"
+                    "4. Restart the connection to Claude"
+                ),
+            }
+
+        return {
+            "enabled": True,
+            "api_key_set": bool(api_key),
+            "blenderkit_addon_detected": addon_detected,
+            "cache_dir": cache_dir,
+            "cached_materials": mat_count,
+            "cached_models": model_count,
+            "message": (
+                "BlenderKit integration is enabled and ready. "
+                f"Cache: {mat_count} materials, {model_count} models at {cache_dir}"
+            ),
+        }
+
+    def search_blenderkit_assets(self, query="", asset_type="material", max_results=20, free_only=True):
+        """Search the BlenderKit asset library."""
+        try:
+            bk_type = BLENDERKIT_ASSET_TYPE_MAP.get(asset_type)
+            if not bk_type:
+                return {"error": f"Invalid asset_type '{asset_type}'. Valid: {list(BLENDERKIT_ASSET_TYPE_MAP)}"}
+
+            params = {
+                "query": query,
+                "asset_type": bk_type,
+                "page_size": min(int(max_results), 20),
+                "order": "-score",
+                "addon_version": "3.12.0.240907",
+            }
+            if free_only:
+                params["is_free"] = "true"
+
+            resp = requests.get(
+                f"{BLENDERKIT_API}/search/",
+                params=params,
+                headers=self._bk_auth_headers(),
+                timeout=15,
+            )
+
+            if resp.status_code == 401:
+                return {"error": "Authentication failed. Check your API key or leave it blank for free assets only."}
+            if resp.status_code != 200:
+                return {"error": f"Search request failed: HTTP {resp.status_code}"}
+
+            data = resp.json()
+            cache_dir = self._bk_cache_dir()
+
+            results = []
+            for asset in data.get("results", []):
+                asset_id = asset.get("id", "")
+                asset_dir = Path(cache_dir, bk_type, str(asset_id))
+                cached = (asset_dir / "asset.blend").exists()
+
+                results.append({
+                    "id": asset_id,
+                    "name": asset.get("displayName") or asset.get("name", ""),
+                    "author": (asset.get("author") or {}).get("fullName", ""),
+                    "asset_type": bk_type,
+                    "is_free": asset.get("isFree", False),
+                    "cached": cached,
+                    "tags": asset.get("tags", [])[:5],
+                })
+
+            return {
+                "assets": results,
+                "total_count": data.get("count", len(results)),
+                "returned_count": len(results),
+            }
+        except requests.exceptions.Timeout:
+            return {"error": "Search request timed out. Check your network connection."}
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Search failed: {str(e)}"}
+
+    def download_blenderkit_asset(self, asset_id, asset_type="material"):
+        """Download a BlenderKit asset to the persistent cache (skips network if cached)."""
+        try:
+            bk_type = BLENDERKIT_ASSET_TYPE_MAP.get(asset_type)
+            if not bk_type:
+                return {"error": f"Invalid asset_type '{asset_type}'. Valid: {list(BLENDERKIT_ASSET_TYPE_MAP)}"}
+
+            blend_path, was_cached = self._bk_get_or_download(str(asset_id), bk_type)
+            if blend_path is None:
+                return {"error": f"Could not download asset {asset_id}. Check API key and asset availability."}
+
+            meta = self._bk_read_meta(str(asset_id), bk_type)
+            return {
+                "success": True,
+                "cached": was_cached,
+                "asset_id": asset_id,
+                "asset_type": bk_type,
+                "name": meta.get("name", asset_id),
+                "path": blend_path,
+                "message": (
+                    f"Asset '{meta.get('name', asset_id)}' loaded from cache."
+                    if was_cached
+                    else f"Asset '{meta.get('name', asset_id)}' downloaded and cached at {blend_path}"
+                ),
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Download failed: {str(e)}"}
+
+    def apply_blenderkit_material(self, asset_id, object_name):
+        """Apply a BlenderKit material to an object (downloads if not cached)."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found in scene."}
+            if not hasattr(obj.data, "materials"):
+                return {"error": f"Object '{object_name}' cannot accept materials (type: {obj.type})."}
+
+            blend_path, was_cached = self._bk_get_or_download(str(asset_id), "material")
+            if blend_path is None:
+                return {"error": f"Could not load asset {asset_id}. Check API key and asset availability."}
+
+            mat = self._bk_append_material(blend_path)
+            if mat is None:
+                return {"error": f"No materials found in blend file: {blend_path}"}
+
+            while len(obj.data.materials) > 0:
+                obj.data.materials.pop(index=0)
+            obj.data.materials.append(mat)
+
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.context.view_layer.update()
+
+            meta = self._bk_read_meta(str(asset_id), "material")
+            return {
+                "success": True,
+                "cached": was_cached,
+                "material": mat.name,
+                "object": object_name,
+                "asset_name": meta.get("name", asset_id),
+                "message": f"Applied material '{mat.name}' to '{object_name}'.",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to apply material: {str(e)}"}
+
+    def import_blenderkit_model(self, asset_id, location=None):
+        """Import a BlenderKit model into the current scene (downloads if not cached)."""
+        try:
+            blend_path, was_cached = self._bk_get_or_download(str(asset_id), "model")
+            if blend_path is None:
+                return {"error": f"Could not load asset {asset_id}. Check API key and asset availability."}
+
+            if blend_path.endswith(".glb") or blend_path.endswith(".gltf"):
+                imported = self._clean_imported_glb(blend_path)
+                imported_names = [imported.name] if imported else []
+            else:
+                imported_names = self._bk_append_objects(blend_path)
+
+            if not imported_names:
+                return {"error": "No objects were imported from the asset file."}
+
+            if location and len(location) == 3:
+                for name in imported_names:
+                    obj = bpy.data.objects.get(name)
+                    if obj:
+                        obj.location = (float(location[0]), float(location[1]), float(location[2]))
+
+            bpy.context.view_layer.update()
+
+            meta = self._bk_read_meta(str(asset_id), "model")
+            return {
+                "success": True,
+                "cached": was_cached,
+                "imported_objects": imported_names,
+                "asset_name": meta.get("name", asset_id),
+                "message": f"Imported model '{meta.get('name', asset_id)}' ({len(imported_names)} objects).",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to import model: {str(e)}"}
+
+    # ---- BlenderKit cache + download helpers --------------------------
+
+    def _bk_cache_dir(self):
+        scene = bpy.context.scene
+        raw = getattr(scene, "blendermcp_blenderkit_cache_dir", DEFAULT_BLENDERKIT_CACHE_DIR) or DEFAULT_BLENDERKIT_CACHE_DIR
+        return os.path.expanduser(raw)
+
+    def _bk_asset_dir(self, asset_id, asset_type):
+        return Path(self._bk_cache_dir(), asset_type, asset_id)
+
+    def _bk_get_or_download(self, asset_id, asset_type):
+        """Return (blend_path, was_cached). Returns (None, False) on failure."""
+        asset_dir = self._bk_asset_dir(asset_id, asset_type)
+        blend_path = asset_dir / "asset.blend"
+
+        if blend_path.exists():
+            return str(blend_path), True
+
+        resp = requests.get(
+            f"{BLENDERKIT_API}/assets/{asset_id}/",
+            headers=self._bk_auth_headers(),
+            timeout=20,
+        )
+        if resp.status_code == 401:
+            raise PermissionError("Authentication failed. Set your API key in the BlenderMCP panel.")
+        if resp.status_code == 404:
+            raise FileNotFoundError(f"Asset {asset_id} not found on BlenderKit.")
+        if resp.status_code != 200:
+            raise RuntimeError(f"BlenderKit API error: HTTP {resp.status_code}")
+
+        asset_data = resp.json()
+        download_url = self._bk_extract_download_url(asset_data)
+        if not download_url:
+            raise RuntimeError("No downloadable .blend file found for this asset.")
+
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".blend", dir=str(asset_dir))
+        try:
+            dl_resp = requests.get(download_url, headers=self._bk_auth_headers(), stream=True, timeout=120)
+            if dl_resp.status_code != 200:
+                raise RuntimeError(f"Download failed: HTTP {dl_resp.status_code}")
+
+            with os.fdopen(tmp_fd, "wb") as f:
+                for chunk in dl_resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+
+            os.replace(tmp_path, str(blend_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        meta = {
+            "id": asset_id,
+            "name": asset_data.get("displayName") or asset_data.get("name", asset_id),
+            "author": (asset_data.get("author") or {}).get("fullName", ""),
+            "asset_type": asset_type,
+            "tags": asset_data.get("tags", []),
+            "is_free": asset_data.get("isFree", False),
+            "downloaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (asset_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        return str(blend_path), False
+
+    def _bk_extract_download_url(self, asset_data):
+        files = asset_data.get("files") or []
+        for preferred_type in ("blend", "glb", "gltf"):
+            for file_entry in files:
+                ft = (file_entry.get("fileType") or "").lower()
+                url = file_entry.get("downloadUrl") or file_entry.get("url") or ""
+                if preferred_type in ft and url:
+                    return url
+        for file_entry in files:
+            url = file_entry.get("downloadUrl") or file_entry.get("url") or ""
+            if url:
+                return url
+        return None
+
+    def _bk_read_meta(self, asset_id, asset_type):
+        meta_path = self._bk_asset_dir(asset_id, asset_type) / "meta.json"
+        if not meta_path.exists():
+            return {}
+        try:
+            return json.loads(meta_path.read_text())
+        except Exception:
+            return {}
+
+    def _bk_append_material(self, blend_path):
+        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+            if src.materials:
+                dst.materials = [src.materials[0]]
+            else:
+                dst.materials = []
+        if dst.materials and dst.materials[0]:
+            return dst.materials[0]
+        return None
+
+    def _bk_append_objects(self, blend_path):
+        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+            dst.objects = list(src.objects)
+
+        imported_names = []
+        collection = bpy.context.collection or bpy.context.scene.collection
+        for obj in dst.objects:
+            if obj is not None:
+                collection.objects.link(obj)
+                imported_names.append(obj.name)
+        return imported_names
+
+    def _bk_resolve_api_key(self):
+        scene_key = getattr(bpy.context.scene, "blendermcp_blenderkit_api_key", "").strip()
+        if scene_key:
+            return scene_key
+
+        if self._bk_addon_installed():
+            try:
+                prefs = bpy.context.preferences.addons["blenderkit"].preferences
+                return getattr(prefs, "api_key", "").strip()
+            except Exception:
+                pass
+        return ""
+
+    def _bk_auth_headers(self):
+        headers = {"Accept": "application/json", "User-Agent": "blender-mcp/1.6"}
+        api_key = self._bk_resolve_api_key()
+        if api_key:
+            headers["Authorization"] = f"Token {api_key}"
+        return headers
+
+    @staticmethod
+    def _bk_addon_installed():
+        return "blenderkit" in bpy.context.preferences.addons
+
+    # ==================================================================
+    # Gaussian Splatting export — ported from BlenderMCP
+    # ==================================================================
+
+    def get_gaussian_splat_status(self):
+        if getattr(bpy.context.scene, "blendermcp_use_gaussian_splat", False):
+            return {"enabled": True, "message": "Gaussian Splatting export is enabled and ready."}
+        return {
+            "enabled": False,
+            "message": (
+                "Gaussian Splatting export is disabled.\n"
+                "1. Find the BlenderMCP panel (press N)\n"
+                "2. Check 'Use Gaussian Splatting Export'\n"
+                "3. Restart the connection to Claude"
+            ),
+        }
+
+    def export_gaussian_splat(self, output_path, density=1000, selected_only=False, format="splat"):
+        """Quick mode: directly sample meshes into a .splat or .ply Gaussian file."""
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+
+            objects = list(bpy.context.selected_objects) if selected_only else list(bpy.context.scene.objects)
+            mesh_objects = [o for o in objects if o.type == "MESH"]
+
+            if not mesh_objects:
+                return {"error": "No mesh objects found in the scene."}
+
+            gaussians = []
+            for obj in mesh_objects:
+                gaussians.extend(_gs_sample_object(obj, depsgraph, density))
+
+            if not gaussians:
+                return {"error": "No Gaussians generated — scene may have zero-area meshes."}
+
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if format == "ply":
+                _gs_write_ply(gaussians, output_path)
+            else:
+                _gs_write_splat(gaussians, output_path)
+
+            return {
+                "success": True,
+                "output_path": output_path,
+                "num_gaussians": len(gaussians),
+                "file_size_bytes": os.path.getsize(output_path),
+                "format": format,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def export_splat_training_data(self, output_dir, num_cameras=50, resolution=800, samples=128):
+        """Quality mode: render multi-view COLMAP training data for external 3DGS training."""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            images_dir = os.path.join(output_dir, "images")
+            sparse_dir = os.path.join(output_dir, "sparse", "0")
+            os.makedirs(images_dir, exist_ok=True)
+            os.makedirs(sparse_dir, exist_ok=True)
+
+            scene_min = mathutils.Vector((float("inf"),) * 3)
+            scene_max = mathutils.Vector((float("-inf"),) * 3)
+            mesh_objects = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+
+            if not mesh_objects:
+                return {"error": "No mesh objects in the scene."}
+
+            for obj in mesh_objects:
+                bb = self._get_aabb(obj)
+                for i in range(3):
+                    scene_min[i] = min(scene_min[i], bb[0][i])
+                    scene_max[i] = max(scene_max[i], bb[1][i])
+
+            center = (scene_min + scene_max) / 2
+            extent = (scene_max - scene_min).length
+            radius = extent * 1.5
+
+            cam_data = bpy.data.cameras.new("_gsplat_cam")
+            cam_data.lens = 50
+            cam_data.sensor_width = 36
+            cam_obj = bpy.data.objects.new("_gsplat_cam", cam_data)
+            bpy.context.collection.objects.link(cam_obj)
+            bpy.context.scene.camera = cam_obj
+
+            bpy.context.scene.render.resolution_x = resolution
+            bpy.context.scene.render.resolution_y = resolution
+            bpy.context.scene.render.image_settings.file_format = "PNG"
+            if bpy.context.scene.render.engine == "CYCLES":
+                bpy.context.scene.cycles.samples = samples
+
+            camera_positions = _gs_fibonacci_sphere(num_cameras, radius, center)
+
+            cam_records = []
+            for idx, pos in enumerate(camera_positions):
+                cam_obj.location = pos
+                direction = center - mathutils.Vector(pos)
+                rot = direction.to_track_quat("-Z", "Y")
+                cam_obj.rotation_euler = rot.to_euler()
+
+                bpy.context.view_layer.update()
+
+                img_name = f"{idx:04d}.png"
+                bpy.context.scene.render.filepath = os.path.join(images_dir, img_name)
+                bpy.ops.render.render(write_still=True)
+
+                mat = cam_obj.matrix_world.inverted()
+                r = mat.to_quaternion()
+                t = mat.to_translation()
+                cam_records.append((idx + 1, r, t, img_name))
+
+            fx = cam_data.lens * resolution / cam_data.sensor_width
+            cx, cy = resolution / 2, resolution / 2
+
+            with open(os.path.join(sparse_dir, "cameras.txt"), "w") as f:
+                f.write("# Camera list: CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+                f.write(f"1 PINHOLE {resolution} {resolution} {fx:.6f} {fx:.6f} {cx:.6f} {cy:.6f}\n")
+
+            with open(os.path.join(sparse_dir, "images.txt"), "w") as f:
+                f.write("# Image list: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n")
+                for img_id, r, t, name in cam_records:
+                    f.write(f"{img_id} {r.w:.8f} {r.x:.8f} {r.y:.8f} {r.z:.8f} {t.x:.8f} {t.y:.8f} {t.z:.8f} 1 {name}\n")
+                    f.write("\n")
+
+            with open(os.path.join(sparse_dir, "points3D.txt"), "w") as f:
+                f.write("# 3D point list (empty — 3DGS will initialise from SfM or random)\n")
+
+            bpy.data.objects.remove(cam_obj)
+            bpy.data.cameras.remove(cam_data)
+
+            instructions = (
+                f"Training data exported to {output_dir}/\n"
+                "To train 3DGS, run one of:\n"
+                f"  gsplat: ns-train gaussian-splatting --data {output_dir}\n"
+                f"  Original: python train.py -s {output_dir} -m {output_dir}/output\n"
+                "After training, use convert_ply_to_splat to get a .splat file."
+            )
+
+            return {
+                "success": True,
+                "output_dir": output_dir,
+                "num_images": num_cameras,
+                "colmap_path": sparse_dir,
+                "instructions": instructions,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def convert_ply_to_splat(self, ply_path, output_path, max_gaussians=None):
+        """Convert a trained 3DGS .ply file into a viewer-ready .splat file."""
+        try:
+            gaussians = _gs_read_3dgs_ply(ply_path)
+
+            if max_gaussians and len(gaussians) > max_gaussians:
+                gaussians = gaussians[:max_gaussians]
+
+            _gs_write_splat(gaussians, output_path)
+
+            return {
+                "success": True,
+                "output_path": output_path,
+                "num_gaussians": len(gaussians),
+                "file_size_bytes": os.path.getsize(output_path),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ==================================================================
+    # VR baking + export — generalized from BlenderMCP vr_bake.py
+    # ==================================================================
+
+    def bake_lightmaps(self, output_dir, resolution=1024, samples=256,
+                       selected_only=True, image_format="EXR", uv_layer="UVMap_Lightmap"):
+        """Bake a COMBINED (direct+indirect+color) lightmap for the target meshes.
+
+        Creates/uses a dedicated lightmap UV layer, smart-projects it, wires a bake
+        target image node into each material, bakes with Cycles, and saves the result.
+        """
+        try:
+            scene = bpy.context.scene
+            os.makedirs(output_dir, exist_ok=True)
+
+            source = bpy.context.selected_objects if selected_only else scene.objects
+            objs = [o for o in source if o.type == "MESH"]
+            if not objs:
+                return {"error": "No mesh objects to bake (check your selection)."}
+
+            # Configure Cycles for baking
+            scene.render.engine = "CYCLES"
+            scene.cycles.samples = int(samples)
+            try:
+                scene.cycles.use_denoising = True
+            except Exception:
+                pass
+            scene.render.bake.use_pass_direct = True
+            scene.render.bake.use_pass_indirect = True
+            scene.render.bake.use_pass_color = True
+            scene.render.bake.use_selected_to_active = False
+            scene.render.bake.margin = 4
+
+            # Ensure a lightmap UV on every object, then smart-project as a batch
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj in objs:
+                obj.hide_viewport = False
+                obj.hide_render = False
+                obj.select_set(True)
+                if uv_layer not in obj.data.uv_layers:
+                    obj.data.uv_layers.new(name=uv_layer)
+                obj.data.uv_layers.active = obj.data.uv_layers[uv_layer]
+                # Bake requires a material with an active image node
+                if not obj.data.materials:
+                    obj.data.materials.append(bpy.data.materials.new(name=f"{obj.name}_LM_Mat"))
+            bpy.context.view_layer.objects.active = objs[0]
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.01,
+                                     correct_aspect=True, scale_to_bounds=True)
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+            # Create the bake image
+            img_name = f"LM_bake_{int(resolution)}"
+            if img_name in bpy.data.images:
+                bpy.data.images.remove(bpy.data.images[img_name])
+            bake_img = bpy.data.images.new(img_name, int(resolution), int(resolution),
+                                           alpha=False, float_buffer=True)
+
+            # Wire the bake target node into every material and re-assert lightmap UV
+            mats_done = set()
+            for obj in objs:
+                if uv_layer in obj.data.uv_layers:
+                    obj.data.uv_layers.active = obj.data.uv_layers[uv_layer]
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if not mat or id(mat) in mats_done:
+                        continue
+                    mats_done.add(id(mat))
+                    if not mat.use_nodes:
+                        mat.use_nodes = True
+                    nodes = mat.node_tree.nodes
+                    bk = nodes.get("__BAKE_TARGET__")
+                    if not bk:
+                        bk = nodes.new("ShaderNodeTexImage")
+                        bk.name = "__BAKE_TARGET__"
+                        bk.location = (-800, -500)
+                    bk.image = bake_img
+                    nodes.active = bk  # active image node is the bake target
+
+            bpy.context.view_layer.objects.active = objs[0]
+            bpy.ops.object.bake(type="COMBINED",
+                                pass_filter={"DIRECT", "INDIRECT", "COLOR"},
+                                use_selected_to_active=False,
+                                use_clear=True, margin=4)
+
+            ext = "exr" if str(image_format).upper() == "EXR" else "png"
+            out_path = os.path.join(output_dir, f"{img_name}.{ext}")
+            bake_img.file_format = "OPEN_EXR" if ext == "exr" else "PNG"
+            bake_img.filepath_raw = out_path
+            bake_img.save()
+
+            bpy.ops.object.select_all(action="DESELECT")
+            return {
+                "success": True,
+                "output_path": out_path,
+                "resolution": int(resolution),
+                "baked_objects": len(objs),
+                "image": img_name,
+            }
+        except Exception as e:
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def export_vr_fbx(self, filepath, decimate_ratio=None, triangulate=True):
+        """Export the scene to a VR-friendly FBX (Y-up, -Z forward, embedded textures).
+
+        If decimate_ratio (0-1) is given, a Decimate modifier is applied to each mesh
+        first to produce a lower-poly Quest LOD.
+        """
+        try:
+            scene = bpy.context.scene
+            tris_before = sum(
+                sum(len(p.vertices) - 2 for p in o.data.polygons)
+                for o in scene.objects if o.type == "MESH"
+            )
+
+            if decimate_ratio and 0 < float(decimate_ratio) < 1:
+                for obj in list(scene.objects):
+                    if obj.type != "MESH":
+                        continue
+                    tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
+                    if tris < 100:
+                        continue
+                    bpy.ops.object.select_all(action="DESELECT")
+                    bpy.context.view_layer.objects.active = obj
+                    obj.select_set(True)
+                    mod = obj.modifiers.new("VR_Decimate", "DECIMATE")
+                    mod.decimate_type = "COLLAPSE"
+                    mod.ratio = float(decimate_ratio)
+                    mod.use_collapse_triangulate = True
+                    try:
+                        bpy.ops.object.modifier_apply(modifier="VR_Decimate")
+                    except Exception:
+                        obj.modifiers.remove(mod)
+
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            bpy.ops.export_scene.fbx(
+                filepath=filepath,
+                use_selection=False,
+                use_visible=True,
+                use_mesh_modifiers=True,
+                use_triangles=bool(triangulate),
+                apply_unit_scale=True,
+                apply_scale_options="FBX_SCALE_NONE",
+                axis_forward="-Z",
+                axis_up="Y",
+                global_scale=1.0,
+                mesh_smooth_type="FACE",
+                path_mode="COPY",
+                embed_textures=True,
+                bake_anim=False,
+                add_leaf_bones=False,
+            )
+
+            tris_after = sum(
+                sum(len(p.vertices) - 2 for p in o.data.polygons)
+                for o in scene.objects if o.type == "MESH"
+            )
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            return {
+                "success": True,
+                "filepath": filepath,
+                "file_size_mb": round(size_mb, 2),
+                "tris_before": tris_before,
+                "tris_after": tris_after,
+                "decimated": bool(decimate_ratio),
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
@@ -2537,6 +3409,18 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 layout.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
                 layout.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
         
+        layout.prop(scene, "blendermcp_use_blenderkit", text="Use assets from BlenderKit")
+        if scene.blendermcp_use_blenderkit:
+            box = layout.box()
+            box.prop(scene, "blendermcp_blenderkit_api_key", text="API Key")
+            box.prop(scene, "blendermcp_blenderkit_cache_dir", text="Cache Dir")
+
+        layout.prop(scene, "blendermcp_use_gaussian_splat", text="Use Gaussian Splatting Export")
+        if scene.blendermcp_use_gaussian_splat:
+            box = layout.box()
+            box.prop(scene, "blendermcp_splat_mode", text="Export Mode")
+            box.prop(scene, "blendermcp_splat_density", text="Density")
+
         if not scene.blendermcp_server_running:
             layout.operator("blendermcp.start_server", text="Connect to MCP server")
         else:
@@ -2619,6 +3503,271 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
         return {'FINISHED'}
 
 # Registration functions
+# ----------------------------------------------------------------------
+# BlenderKit constants
+# ----------------------------------------------------------------------
+BLENDERKIT_API = "https://www.blenderkit.com/api/v1"
+DEFAULT_BLENDERKIT_CACHE_DIR = os.path.expanduser("~/blenderkit_data")
+BLENDERKIT_ASSET_TYPE_MAP = {
+    "material": "material",
+    "model": "model",
+    "hdr": "hdr",
+    "brush": "brush",
+    "scene": "scene",
+}
+
+# ----------------------------------------------------------------------
+# Gaussian Splatting module helpers (ported from BlenderMCP)
+# ----------------------------------------------------------------------
+_C0 = 0.28209479177387814  # SH degree-0 basis constant
+
+
+def _gs_sample_object(obj, depsgraph, density):
+    """Sample Gaussians from a single mesh object."""
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+
+    if mesh is None or len(mesh.polygons) == 0:
+        return []
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces)
+
+    world_matrix = obj.matrix_world
+
+    base_color = (0.7, 0.7, 0.7, 1.0)
+    if obj.data.materials and obj.data.materials[0]:
+        mat = obj.data.materials[0]
+        if mat.use_nodes:
+            for node in mat.node_tree.nodes:
+                if node.type == "BSDF_PRINCIPLED":
+                    bc = node.inputs["Base Color"].default_value
+                    base_color = (bc[0], bc[1], bc[2], bc[3] if len(bc) > 3 else 1.0)
+                    break
+
+    color_layer = None
+    if mesh.vertex_colors:
+        color_layer = mesh.vertex_colors.active
+
+    spacing = 1.0 / math.sqrt(max(density, 1))
+
+    gaussians = []
+
+    for face in bm.faces:
+        verts = face.verts
+        v0 = world_matrix @ verts[0].co
+        v1 = world_matrix @ verts[1].co
+        v2 = world_matrix @ verts[2].co
+
+        e1 = v1 - v0
+        e2 = v2 - v0
+        area = e1.cross(e2).length * 0.5
+
+        n_samples = max(1, int(area * density))
+
+        face_normal = (world_matrix.to_3x3() @ face.normal).normalized()
+        quat = face_normal.to_track_quat("Z", "Y")
+
+        for _ in range(n_samples):
+            u1 = random.random()
+            u2 = random.random()
+            s = math.sqrt(u1)
+            bary = (1 - s, s * (1 - u2), s * u2)
+
+            pos = v0 * bary[0] + v1 * bary[1] + v2 * bary[2]
+
+            color = base_color
+            if color_layer and face.index < len(mesh.polygons):
+                poly = mesh.polygons[face.index]
+                if poly.loop_total >= 3:
+                    loops = list(poly.loop_indices)
+                    c0 = color_layer.data[loops[0]].color
+                    c1 = color_layer.data[loops[1]].color
+                    c2 = color_layer.data[loops[2]].color
+                    color = (
+                        c0[0] * bary[0] + c1[0] * bary[1] + c2[0] * bary[2],
+                        c0[1] * bary[0] + c1[1] * bary[1] + c2[1] * bary[2],
+                        c0[2] * bary[0] + c1[2] * bary[1] + c2[2] * bary[2],
+                        c0[3] * bary[0] + c1[3] * bary[1] + c2[3] * bary[2],
+                    )
+
+            scale_t = spacing * 0.5
+            scale_n = scale_t * 0.1
+
+            gaussians.append({
+                "position": (pos.x, pos.y, pos.z),
+                "scale": (scale_t, scale_t, scale_n),
+                "color": (
+                    max(0, min(255, int(color[0] * 255))),
+                    max(0, min(255, int(color[1] * 255))),
+                    max(0, min(255, int(color[2] * 255))),
+                    max(0, min(255, int(color[3] * 255))),
+                ),
+                "rotation": (quat.w, quat.x, quat.y, quat.z),
+            })
+
+    bm.free()
+    eval_obj.to_mesh_clear()
+
+    return gaussians
+
+
+def _gs_write_splat(gaussians, path):
+    """Write a 32-byte-per-Gaussian .splat binary file."""
+    with open(path, "wb") as f:
+        for g in gaussians:
+            f.write(struct.pack("<3f", *g["position"]))
+            f.write(struct.pack("<3f", *g["scale"]))
+            f.write(struct.pack("4B", *g["color"]))
+            rot_bytes = tuple(max(0, min(255, int(q * 128 + 128))) for q in g["rotation"])
+            f.write(struct.pack("4B", *rot_bytes))
+
+
+def _gs_write_ply(gaussians, path):
+    """Write a 3DGS-standard binary little-endian PLY file."""
+    n = len(gaussians)
+    header_lines = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {n}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float nx",
+        "property float ny",
+        "property float nz",
+        "property float f_dc_0",
+        "property float f_dc_1",
+        "property float f_dc_2",
+    ]
+    for i in range(45):
+        header_lines.append(f"property float f_rest_{i}")
+    header_lines += [
+        "property float opacity",
+        "property float scale_0",
+        "property float scale_1",
+        "property float scale_2",
+        "property float rot_0",
+        "property float rot_1",
+        "property float rot_2",
+        "property float rot_3",
+        "end_header",
+    ]
+    header = "\n".join(header_lines) + "\n"
+
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        zero_rest = struct.pack("<45f", *([0.0] * 45))
+
+        for g in gaussians:
+            px, py, pz = g["position"]
+            r, gr, b, a = g["color"]
+
+            rl = r / 255.0
+            gl_ = gr / 255.0
+            bl = b / 255.0
+
+            dc0 = (rl - 0.5) / _C0
+            dc1 = (gl_ - 0.5) / _C0
+            dc2 = (bl - 0.5) / _C0
+
+            alpha = max(0.001, min(0.999, a / 255.0))
+            opacity = math.log(alpha / (1.0 - alpha))
+
+            sx, sy, sz = g["scale"]
+            ls0 = math.log(max(sx, 1e-7))
+            ls1 = math.log(max(sy, 1e-7))
+            ls2 = math.log(max(sz, 1e-7))
+
+            qw, qx, qy, qz = g["rotation"]
+
+            f.write(struct.pack("<3f", px, py, pz))
+            f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
+            f.write(struct.pack("<3f", dc0, dc1, dc2))
+            f.write(zero_rest)
+            f.write(struct.pack("<f", opacity))
+            f.write(struct.pack("<3f", ls0, ls1, ls2))
+            f.write(struct.pack("<4f", qw, qx, qy, qz))
+
+
+def _gs_fibonacci_sphere(n, radius, center):
+    """Generate *n* camera positions on a Fibonacci sphere around *center*."""
+    golden = (1 + math.sqrt(5)) / 2
+    positions = []
+    for i in range(n):
+        theta = math.acos(1 - 2 * (i + 0.5) / n)
+        phi = 2 * math.pi * i / golden
+        x = center.x + radius * math.sin(theta) * math.cos(phi)
+        y = center.y + radius * math.sin(theta) * math.sin(phi)
+        z = center.z + radius * math.cos(theta)
+        positions.append((x, y, z))
+    return positions
+
+
+def _gs_read_3dgs_ply(path):
+    """Parse a 3DGS-trained PLY file and return a list of Gaussian dicts."""
+    with open(path, "rb") as f:
+        properties = []
+        vertex_count = 0
+        while True:
+            line = f.readline().decode("ascii").strip()
+            if line == "end_header":
+                break
+            if line.startswith("element vertex"):
+                vertex_count = int(line.split()[-1])
+            elif line.startswith("property float"):
+                properties.append(line.split()[-1])
+
+        prop_count = len(properties)
+        row_bytes = prop_count * 4
+        prop_index = {name: i for i, name in enumerate(properties)}
+
+        gaussians = []
+        for _ in range(vertex_count):
+            raw = f.read(row_bytes)
+            vals = struct.unpack(f"<{prop_count}f", raw)
+
+            px = vals[prop_index.get("x", 0)]
+            py = vals[prop_index.get("y", 0)]
+            pz = vals[prop_index.get("z", 0)]
+
+            dc0 = vals[prop_index.get("f_dc_0", 0)]
+            dc1 = vals[prop_index.get("f_dc_1", 0)]
+            dc2 = vals[prop_index.get("f_dc_2", 0)]
+            r = max(0, min(255, int((_gs_sigmoid(dc0 * _C0 + 0.5)) * 255)))
+            g = max(0, min(255, int((_gs_sigmoid(dc1 * _C0 + 0.5)) * 255)))
+            b = max(0, min(255, int((_gs_sigmoid(dc2 * _C0 + 0.5)) * 255)))
+
+            opacity_logit = vals[prop_index.get("opacity", 0)]
+            a = max(0, min(255, int(_gs_sigmoid(opacity_logit) * 255)))
+
+            sx = math.exp(vals[prop_index.get("scale_0", 0)])
+            sy = math.exp(vals[prop_index.get("scale_1", 0)])
+            sz = math.exp(vals[prop_index.get("scale_2", 0)])
+
+            qw = vals[prop_index.get("rot_0", 0)]
+            qx = vals[prop_index.get("rot_1", 0)]
+            qy = vals[prop_index.get("rot_2", 0)]
+            qz = vals[prop_index.get("rot_3", 0)]
+
+            gaussians.append({
+                "position": (px, py, pz),
+                "scale": (sx, sy, sz),
+                "color": (r, g, b, a),
+                "rotation": (qw, qx, qy, qz),
+            })
+
+    return gaussians
+
+
+def _gs_sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    ex = math.exp(x)
+    return ex / (1.0 + ex)
+
+
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
         name="Port",
@@ -2746,6 +3895,49 @@ def register():
         default=""
     )
 
+    bpy.types.Scene.blendermcp_use_blenderkit = bpy.props.BoolProperty(
+        name="Use BlenderKit",
+        description="Enable BlenderKit asset integration",
+        default=False
+    )
+
+    bpy.types.Scene.blendermcp_blenderkit_api_key = bpy.props.StringProperty(
+        name="BlenderKit API Key",
+        subtype="PASSWORD",
+        description="BlenderKit API token from blenderkit.com/profile (optional for free assets)",
+        default=""
+    )
+
+    bpy.types.Scene.blendermcp_blenderkit_cache_dir = bpy.props.StringProperty(
+        name="BlenderKit Cache Directory",
+        subtype="DIR_PATH",
+        description="Directory where BlenderKit assets are stored persistently",
+        default=DEFAULT_BLENDERKIT_CACHE_DIR
+    )
+
+    bpy.types.Scene.blendermcp_use_gaussian_splat = bpy.props.BoolProperty(
+        name="Use Gaussian Splatting Export",
+        description="Enable Gaussian Splatting (.splat) export",
+        default=False
+    )
+
+    bpy.types.Scene.blendermcp_splat_density = bpy.props.IntProperty(
+        name="Splat Density",
+        description="Number of Gaussians per square Blender unit",
+        default=1000,
+        min=100,
+        max=50000
+    )
+
+    bpy.types.Scene.blendermcp_splat_mode = bpy.props.EnumProperty(
+        name="Splat Export Mode",
+        items=[
+            ("QUICK", "Quick (Mesh Sampling)", "Direct mesh-to-splat conversion"),
+            ("QUALITY", "Quality (Render Pipeline)", "Render training data for external 3DGS training"),
+        ],
+        default="QUICK"
+    )
+
     # Register preferences class
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
@@ -2806,6 +3998,12 @@ def unregister():
     del bpy.types.Scene.blendermcp_hunyuan3d_num_inference_steps
     del bpy.types.Scene.blendermcp_hunyuan3d_guidance_scale
     del bpy.types.Scene.blendermcp_hunyuan3d_texture
+    del bpy.types.Scene.blendermcp_use_blenderkit
+    del bpy.types.Scene.blendermcp_blenderkit_api_key
+    del bpy.types.Scene.blendermcp_blenderkit_cache_dir
+    del bpy.types.Scene.blendermcp_use_gaussian_splat
+    del bpy.types.Scene.blendermcp_splat_density
+    del bpy.types.Scene.blendermcp_splat_mode
 
     print("BlenderMCP addon unregistered")
 

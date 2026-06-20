@@ -279,6 +279,37 @@ Here are some examples of what you can ask Claude to do:
 - "Make the lighting like a studio"
 - "Point the camera at the scene, and make it isometric"
 
+## Added integrations (this fork)
+
+This fork adds extra MCP tools on top of upstream, ported from the `aasurjya/BlenderMCP`
+project. All of them work through the same single-file `addon.py` + MCP server.
+
+### Scene-op tools (always on)
+First-class tools so you don't have to fall back to `execute_blender_code`:
+- `create_primitive(type, name, size)` — cube, sphere, cylinder, cone, torus, plane, monkey
+- `delete_object(name)`
+- `set_material(object_name, material_name, r, g, b)`
+- `export_scene(filepath, format)` — glb, gltf, fbx, obj, stl, ply (uses Blender 4.0+ export operators)
+- `render_scene(filepath, engine, resolution_x, resolution_y)`
+
+### BlenderKit (enable "Use assets from BlenderKit" in the sidebar)
+Search/download/apply/import assets from [BlenderKit](https://www.blenderkit.com/) with a
+persistent on-disk cache. Optional API key (free assets work without one).
+- `get_blenderkit_status`, `search_blenderkit_assets`, `download_blenderkit_asset`,
+  `apply_blenderkit_material`, `import_blenderkit_model`
+
+### Gaussian Splatting export (enable "Use Gaussian Splatting Export")
+- `export_gaussian_splat(output_path, density, selected_only, format)` — direct mesh-to-`.splat`/`.ply`
+- `export_splat_training_data(output_dir, num_cameras, resolution, samples)` — render multi-view COLMAP data for external 3DGS training
+- `convert_ply_to_splat(ply_path, output_path, max_gaussians)` — trained `.ply` → viewer-ready `.splat`
+
+### VR baking + export (always on)
+- `bake_lightmaps(output_dir, resolution, samples, selected_only, image_format, uv_layer)` — Cycles COMBINED lightmap bake with a dedicated lightmap UV
+- `export_vr_fbx(filepath, decimate_ratio, triangulate)` — Y-up/-Z-forward FBX for Unity/Quest/PCVR; `decimate_ratio=0.25` produces a Quest LOD
+
+The full, project-specific reference pipeline (normal-map baking, per-group lightmaps,
+Quest decimation, web GLB build) lives as standalone scripts in [`vr/`](vr/).
+
 ## Hyper3D integration
 
 Hyper3D's free trial key allows you to generate a limited number of models per day. If the daily limit is reached, you can wait for the next day's reset or obtain your own key from hyper3d.ai and fal.ai.

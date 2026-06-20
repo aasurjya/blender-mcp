@@ -390,6 +390,140 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
         return f"Error executing code: {str(e)}"
 
 @mcp.tool()
+@telemetry_tool("create_primitive")
+def create_primitive(
+    ctx: Context,
+    type: str = "cube",
+    name: str = None,
+    size: float = 1.0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Create a primitive mesh object in Blender.
+
+    Parameters:
+    - type: cube, sphere, cylinder, cone, torus, plane, or monkey
+    - name: Optional name for the created object
+    - size: Base size of the primitive (default 1.0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_primitive", {
+            "type": type,
+            "name": name,
+            "size": size,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error creating primitive: {str(e)}")
+        return f"Error creating primitive: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_object")
+def delete_object(ctx: Context, name: str, user_prompt: str = "") -> str:
+    """
+    Delete an object from the Blender scene by name.
+
+    Parameters:
+    - name: The name of the object to delete
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_object", {"name": name})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting object: {str(e)}")
+        return f"Error deleting object: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("set_material")
+def set_material(
+    ctx: Context,
+    object_name: str,
+    material_name: str = None,
+    r: float = None,
+    g: float = None,
+    b: float = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Create or assign a Principled BSDF material on an object, optionally with a base color.
+
+    Parameters:
+    - object_name: The object to apply the material to
+    - material_name: Optional material name (reused if it already exists)
+    - r, g, b: Optional base color components in the 0.0-1.0 range
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"object_name": object_name, "material_name": material_name}
+        if r is not None or g is not None or b is not None:
+            params["color"] = {
+                "r": r if r is not None else 0.8,
+                "g": g if g is not None else 0.8,
+                "b": b if b is not None else 0.8,
+            }
+        result = blender.send_command("set_material", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting material: {str(e)}")
+        return f"Error setting material: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("export_scene")
+def export_scene(ctx: Context, filepath: str, format: str = "glb", user_prompt: str = "") -> str:
+    """
+    Export the Blender scene to a file.
+
+    Parameters:
+    - filepath: Absolute output path
+    - format: glb, gltf, fbx, obj, stl, or ply (default glb)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_scene", {"filepath": filepath, "format": format})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting scene: {str(e)}")
+        return f"Error exporting scene: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("render_scene")
+def render_scene(
+    ctx: Context,
+    filepath: str,
+    engine: str = None,
+    resolution_x: int = None,
+    resolution_y: int = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Render the current Blender scene to an image file.
+
+    Parameters:
+    - filepath: Absolute output path for the rendered image
+    - engine: Optional CYCLES, BLENDER_EEVEE, BLENDER_EEVEE_NEXT, or BLENDER_WORKBENCH
+    - resolution_x / resolution_y: Optional output resolution overrides
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_scene", {
+            "filepath": filepath,
+            "engine": engine,
+            "resolution_x": resolution_x,
+            "resolution_y": resolution_y,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error rendering scene: {str(e)}")
+        return f"Error rendering scene: {str(e)}"
+
+@mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
 def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
     """
@@ -1226,6 +1360,327 @@ def asset_creation_strategy() -> str:
     - When executing multiple operations, take intermediate screenshots to confirm each step
     - If something looks wrong in the screenshot or scene info, investigate and fix before proceeding
     """
+
+@mcp.tool()
+@telemetry_tool("get_blenderkit_status")
+def get_blenderkit_status(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Check whether the BlenderKit integration is enabled and report cache stats.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_blenderkit_status")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting BlenderKit status: {str(e)}")
+        return f"Error getting BlenderKit status: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("search_blenderkit_assets")
+def search_blenderkit_assets(
+    ctx: Context,
+    query: str = "",
+    asset_type: str = "material",
+    max_results: int = 20,
+    free_only: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Search the BlenderKit asset library. Requires the BlenderKit integration to be
+    enabled in the BlenderMCP sidebar.
+
+    Parameters:
+    - query: Search keywords
+    - asset_type: material, model, hdr, brush, or scene
+    - max_results: Maximum results (capped at 20)
+    - free_only: Only return free assets (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("search_blenderkit_assets", {
+            "query": query,
+            "asset_type": asset_type,
+            "max_results": max_results,
+            "free_only": free_only,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error searching BlenderKit: {str(e)}")
+        return f"Error searching BlenderKit: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("download_blenderkit_asset")
+def download_blenderkit_asset(
+    ctx: Context,
+    asset_id: str,
+    asset_type: str = "material",
+    user_prompt: str = "",
+) -> str:
+    """
+    Download a BlenderKit asset to the persistent cache (skips network if already cached).
+
+    Parameters:
+    - asset_id: BlenderKit asset UUID from search results
+    - asset_type: material, model, hdr, brush, or scene
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("download_blenderkit_asset", {
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error downloading BlenderKit asset: {str(e)}")
+        return f"Error downloading BlenderKit asset: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("apply_blenderkit_material")
+def apply_blenderkit_material(
+    ctx: Context,
+    asset_id: str,
+    object_name: str,
+    user_prompt: str = "",
+) -> str:
+    """
+    Apply a BlenderKit material to an object (downloads it first if not cached).
+
+    Parameters:
+    - asset_id: BlenderKit material UUID
+    - object_name: Name of the object to apply the material to
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_blenderkit_material", {
+            "asset_id": asset_id,
+            "object_name": object_name,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error applying BlenderKit material: {str(e)}")
+        return f"Error applying BlenderKit material: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("import_blenderkit_model")
+def import_blenderkit_model(
+    ctx: Context,
+    asset_id: str,
+    location_x: float = None,
+    location_y: float = None,
+    location_z: float = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Import a BlenderKit model into the scene (downloads it first if not cached).
+
+    Parameters:
+    - asset_id: BlenderKit model UUID
+    - location_x/y/z: Optional world-space placement
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"asset_id": asset_id}
+        if location_x is not None and location_y is not None and location_z is not None:
+            params["location"] = [location_x, location_y, location_z]
+        result = blender.send_command("import_blenderkit_model", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error importing BlenderKit model: {str(e)}")
+        return f"Error importing BlenderKit model: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_gaussian_splat_status")
+def get_gaussian_splat_status(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Check whether Gaussian Splatting export is enabled in the BlenderMCP sidebar.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_gaussian_splat_status")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting Gaussian Splatting status: {str(e)}")
+        return f"Error getting Gaussian Splatting status: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("export_gaussian_splat")
+def export_gaussian_splat(
+    ctx: Context,
+    output_path: str,
+    density: int = 1000,
+    selected_only: bool = False,
+    format: str = "splat",
+    user_prompt: str = "",
+) -> str:
+    """
+    Quick mode: directly sample scene meshes into a Gaussian Splat file.
+    Requires Gaussian Splatting export to be enabled in the BlenderMCP sidebar.
+
+    Parameters:
+    - output_path: Absolute output path (.splat or .ply)
+    - density: Number of Gaussians per square Blender unit (default 1000)
+    - selected_only: Only sample selected objects (default False)
+    - format: "splat" or "ply" (default "splat")
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_gaussian_splat", {
+            "output_path": output_path,
+            "density": density,
+            "selected_only": selected_only,
+            "format": format,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting Gaussian splat: {str(e)}")
+        return f"Error exporting Gaussian splat: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("export_splat_training_data")
+def export_splat_training_data(
+    ctx: Context,
+    output_dir: str,
+    num_cameras: int = 50,
+    resolution: int = 800,
+    samples: int = 128,
+    user_prompt: str = "",
+) -> str:
+    """
+    Quality mode: render multi-view COLMAP training data for external 3DGS training.
+    Requires Gaussian Splatting export to be enabled in the BlenderMCP sidebar.
+
+    Parameters:
+    - output_dir: Directory to write images/ and sparse/ COLMAP data
+    - num_cameras: Number of camera viewpoints (default 50)
+    - resolution: Square render resolution in pixels (default 800)
+    - samples: Cycles samples per render (default 128)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_splat_training_data", {
+            "output_dir": output_dir,
+            "num_cameras": num_cameras,
+            "resolution": resolution,
+            "samples": samples,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting splat training data: {str(e)}")
+        return f"Error exporting splat training data: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("convert_ply_to_splat")
+def convert_ply_to_splat(
+    ctx: Context,
+    ply_path: str,
+    output_path: str,
+    max_gaussians: int = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Convert a trained 3DGS .ply file into a viewer-ready .splat file.
+
+    Parameters:
+    - ply_path: Path to the trained 3DGS .ply file
+    - output_path: Output .splat path
+    - max_gaussians: Optional cap on the number of Gaussians written
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("convert_ply_to_splat", {
+            "ply_path": ply_path,
+            "output_path": output_path,
+            "max_gaussians": max_gaussians,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error converting PLY to splat: {str(e)}")
+        return f"Error converting PLY to splat: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("bake_lightmaps")
+def bake_lightmaps(
+    ctx: Context,
+    output_dir: str,
+    resolution: int = 1024,
+    samples: int = 256,
+    selected_only: bool = True,
+    image_format: str = "EXR",
+    uv_layer: str = "UVMap_Lightmap",
+    user_prompt: str = "",
+) -> str:
+    """
+    Bake a COMBINED (direct+indirect+color) lightmap for the target meshes with Cycles.
+    Creates a dedicated lightmap UV, smart-projects it, and saves the baked image.
+
+    Parameters:
+    - output_dir: Directory to write the baked lightmap into
+    - resolution: Lightmap resolution in pixels (default 1024)
+    - samples: Cycles samples for the bake (default 256)
+    - selected_only: Bake only selected objects (default True); False bakes all meshes
+    - image_format: "EXR" (HDR, default) or "PNG"
+    - uv_layer: Name of the lightmap UV layer to create/use
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("bake_lightmaps", {
+            "output_dir": output_dir,
+            "resolution": resolution,
+            "samples": samples,
+            "selected_only": selected_only,
+            "image_format": image_format,
+            "uv_layer": uv_layer,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error baking lightmaps: {str(e)}")
+        return f"Error baking lightmaps: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("export_vr_fbx")
+def export_vr_fbx(
+    ctx: Context,
+    filepath: str,
+    decimate_ratio: float = None,
+    triangulate: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Export the scene to a VR-friendly FBX (Y-up, -Z forward, triangulated, embedded textures).
+    Suitable for Unity / Quest / PCVR. Optionally decimate first for a Quest LOD.
+
+    Parameters:
+    - filepath: Absolute output .fbx path
+    - decimate_ratio: Optional 0-1 collapse ratio applied to each mesh before export
+      (e.g. 0.25 keeps ~25% of triangles for a Quest build)
+    - triangulate: Triangulate meshes on export (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_vr_fbx", {
+            "filepath": filepath,
+            "decimate_ratio": decimate_ratio,
+            "triangulate": triangulate,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting VR FBX: {str(e)}")
+        return f"Error exporting VR FBX: {str(e)}"
 
 # Main execution
 
