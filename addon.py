@@ -682,9 +682,33 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
+    # Datablock removals that have hard-crashed a live session: freeing data an object still
+    # references leaves the depsgraph with a dangling pointer and Blender dies with
+    # EXCEPTION_ACCESS_VIOLATION in DepsgraphNodeBuilder::build_materials. An agent driving a
+    # long build cannot recover from that, so these are blocked unless the caller opts in.
+    DESTRUCTIVE_PATTERNS = (
+        ("bpy.data.materials.remove", "removing a material an object still uses crashes the depsgraph"),
+        ("bpy.data.meshes.remove", "removing mesh data an object still uses crashes the depsgraph"),
+        ("bpy.data.images.remove", "removing an image a material still samples breaks rendering"),
+        ("orphans_purge", "purging orphans mid-build frees data the depsgraph is still walking"),
+        ("read_factory_settings", "wipes the open scene"),
+        ("read_homefile", "wipes the open scene"),
+        ("wm.open_mainfile", "replaces the open file; unsaved work in it is lost"),
+    )
+    DESTRUCTIVE_OVERRIDE = "ALLOW_DESTRUCTIVE"
+
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         # This is powerful but potentially dangerous - use with caution
+        hits = [f"{pat} ({why})" for pat, why in self.DESTRUCTIVE_PATTERNS if pat in code]
+        if hits and self.DESTRUCTIVE_OVERRIDE not in code:
+            raise Exception(
+                "Refused: this code contains an operation that has crashed a live session before -> "
+                + "; ".join(hits)
+                + f". Prefer a non-destructive route (unlink/hide/rename, or reuse the datablock by name). "
+                f"If it really is required, save the file first and include the comment "
+                f"# {self.DESTRUCTIVE_OVERRIDE} in the code to opt in."
+            )
         try:
             # Create a local namespace for execution
             namespace = {"bpy": bpy}
@@ -2656,7 +2680,7 @@ class BlenderMCPServer:
                 "asset_type": bk_type,
                 "page_size": min(int(max_results), 20),
                 "order": "-score",
-                "addon_version": "3.12.0.240907",
+                "addon_version": "3.12.0",  # BlenderKit API rejects 4-part versions (HTTP 400)
             }
             if free_only:
                 params["is_free"] = "true"
